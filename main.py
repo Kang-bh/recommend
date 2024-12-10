@@ -1,134 +1,154 @@
+import argparse
 import torch
-from transformers import GPT2Tokenizer, GPT2LMHeadModel, BertTokenizer, BertModel
-import pandas as pd
-import numpy as np
-from torch.utils.data import DataLoader, Dataset
-from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.metrics import precision_score, recall_score, f1_score
-import data_process
+from models import SASRec, AlignmentNetwork
+from train import train_stage1, train_stage2
+from data_loader import load_data, create_dataloader
+from config import *
+from openai import AzureOpenAI
+from transformers import pipeline
+import time
 
-df = pd.read_csv("./book/reviews.csv")
-books_df = pd.read_csv("./book/book_metadata.csv")
+import os
+os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
-train_data = df[:1000]  # 데이터 크기를 3600개로 줄임
-valid_data = df[3600:4800]
-test_data = df[4800:6000]
 
-device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+# def llm_inference(prompt):
+#     client = AzureOpenAI(
+#         azure_endpoint=AZURE_OPENAI_ENDPOINT,
+#         api_key=AZURE_OPENAI_API_KEY,
+#         api_version="2024-02-15-preview"
+#     )
+#     response = client.chat.completions.create(
+#         model="gpt-3.5-turbo",
+#         messages=[
+#             {"role": "system", "content": "You are a helpful book recommendation assistant."},
+#             {"role": "user", "content": prompt}
+#         ]
+#     )
+#     return response.choices[0].message.content
 
-gpt_tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
-gpt_model = GPT2LMHeadModel.from_pretrained('gpt2')
+def generate_llm_prompt(user_history, aligned_emb, books_df):
+    prompt = f"User history: {user_history}\n"
+    prompt += f"Aligned embedding: {aligned_emb.tolist()}\n"
+    prompt += "Based on this information, recommend a book and explain why."
+    return prompt
 
-bert_tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-bert_model = BertModel.from_pretrained('bert-base-uncased')
+def llm_inference(prompt):
+    generator = pipeline('text-generation', model='facebook/opt-1.3b')
+    response = generator(prompt, max_length=100, num_return_sequences=1)
+    return response[0]['generated_text']
 
-bert_model = bert_model.to(device)
-gpt_model = gpt_model.to(device)
+def main():
+    total_start_time = time.time()
 
-class ReviewDataset(Dataset):
-    def __init__(self, data, tokenizer, max_len):
-        self.data = data
-        self.tokenizer = tokenizer
-        self.max_len = max_len
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--pretrain_stage1", action='store_true')
+    parser.add_argument("--pretrain_stage2", action='store_true')
+    parser.add_argument("--inference", action='store_true')
+    args = parser.parse_args()
 
-    def __len__(self):
-        return len(self.data)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
 
-    def __getitem__(self, index):
-        review = str(self.data.iloc[index]['review/text'])
-        book_title = str(self.data.iloc[index]['Title'])
-        encoding = self.tokenizer.encode_plus(
-            review,
-            max_length=self.max_len,
-            padding='max_length',
-            truncation=True,
-            return_tensors='pt'
-        )
-        return {
-            'input_ids': encoding['input_ids'].flatten(),
-            'attention_mask': encoding['attention_mask'].flatten(),
-            'book_title': book_title
-        }
+    data_load_start = time.time()
+    books_df, train_data, test_data = load_data(BOOKS_PATH, REVIEWS_PATH)
+    data_load_end = time.time()
+    print(f"Data loading time: {data_load_end - data_load_start:.2f} seconds")
 
-train_dataset = ReviewDataset(train_data, bert_tokenizer, max_len=128)
-train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
+    if args.pretrain_stage1:
+        stage1_start = time.time()
+        model = SASRec(num_items=len(books_df), d_model=ITEM_DIM, nhead=NUM_HEADS, 
+                       num_layers=NUM_LAYERS, dropout=DROPOUT).to(device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE1)
+        train_loader = create_dataloader(train_data, books_df, BATCH_SIZE1)
 
-def get_bert_embeddings(model, data_loader, device):
-    model.eval()
-    embeddings = []
+        for epoch in range(EPOCHS):
+            epoch_start = time.time()
+            loss = train_stage1(model, train_loader, optimizer, device)
+            epoch_end = time.time()
+            print(f"Epoch {epoch+1}/{EPOCHS}, Loss: {loss:.4f}, Time: {epoch_end - epoch_start:.2f} seconds")
 
-    with torch.no_grad():
-        for batch in data_loader:
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
+        torch.save(model.state_dict(), 'sasrec_model.pth')
+        stage1_end = time.time()
+        print(f"Stage 1 training time: {stage1_end - stage1_start:.2f} seconds")
 
-            outputs = model(input_ids, attention_mask=attention_mask)
-            last_hidden_state = outputs.last_hidden_state
-            cls_embeddings = last_hidden_state[:, 0, :]
-            embeddings.append(cls_embeddings.cpu().numpy())
+    elif args.pretrain_stage2:
+        stage2_start = time.time()
+        print("Starting Stage 2 pre-training...")
 
-    return np.vstack(embeddings)
+        print("Initializing SASRec model...")
+        model = SASRec(num_items=len(books_df), d_model=ITEM_DIM, nhead=NUM_HEADS, 
+                    num_layers=NUM_LAYERS, dropout=DROPOUT).to(device)
+        print("SASRec model initialized.")
 
-def get_book_embeddings(model, book_titles, tokenizer, device):
-    embeddings = []
-    for title in book_titles:
-        if pd.isna(title):
-            continue
+        print("Loading SASRec model weights...")
+        model.load_state_dict(torch.load('sasrec_model.pth'))
+        print("SASRec model weights loaded successfully.")
+
+        print("Initializing Alignment Network...")
+        alignment_network = AlignmentNetwork(ITEM_DIM, LLM_DIM).to(device)
+        print("Alignment Network initialized.")
+
+        print("Setting up optimizer...")
+        optimizer = torch.optim.Adam(list(model.parameters()) + list(alignment_network.parameters()), lr=LEARNING_RATE2)
+        print("Optimizer set up complete.")
+
+        print("Creating data loader...")
+        train_loader = create_dataloader(train_data, books_df, BATCH_SIZE2)
+        print("Data loader created.")
+
+        print("Starting training loop...")
+        for epoch in range(EPOCHS):
+            print(f"Epoch {epoch+1}/{EPOCHS} starting...")
+            epoch_start = time.time()
+            loss = train_stage2(model, alignment_network, train_loader, optimizer, device)
+            epoch_end = time.time()
+            print(f"Epoch {epoch+1}/{EPOCHS} completed.")
+            print(f"Epoch {epoch+1}/{EPOCHS}, Loss: {loss:.4f}, Time: {epoch_end - epoch_start:.2f} seconds")
+
+        print("Training loop completed.")
+
+        print("Saving Alignment Network...")
+        torch.save(alignment_network.state_dict(), 'alignment_network.pth')
+        print("Alignment Network saved successfully.")
+
+        stage2_end = time.time()
+        print(f"Stage 2 training completed. Total time: {stage2_end - stage2_start:.2f} seconds")
+
+
+    elif args.inference:
+        inference_start = time.time()
+        model = SASRec(num_items=len(books_df), d_model=ITEM_DIM, nhead=NUM_HEADS, 
+                       num_layers=NUM_LAYERS, dropout=DROPOUT).to(device)
+        model.load_state_dict(torch.load('sasrec_model.pth'))
         
-        encoding = tokenizer.encode_plus(
-            title,
-            max_length=128,
-            padding='max_length',
-            truncation=True,
-            return_tensors='pt'
-        )
-        input_ids = encoding['input_ids'].to(device)
-        attention_mask = encoding['attention_mask'].to(device)
+        alignment_network = AlignmentNetwork(ITEM_DIM, LLM_DIM).to(device)
+        alignment_network.load_state_dict(torch.load('alignment_network.pth'))
 
+        user_history = test_data[test_data['reviewerID'] == test_data['reviewerID'].iloc[0]]
+        user_sequence = user_history['asin'].tolist()
+
+        embedding_start = time.time()
         with torch.no_grad():
-            outputs = model(input_ids, attention_mask=attention_mask)
-            last_hidden_state = outputs.last_hidden_state
-            cls_embedding = last_hidden_state[:, 0, :].cpu().numpy()
-            embeddings.append(cls_embedding)
+            cf_emb = model(torch.tensor(user_sequence).unsqueeze(0).to(device))
+            aligned_emb = alignment_network(cf_emb[:, -1, :])
+        embedding_end = time.time()
+        print(f"Embedding generation time: {embedding_end - embedding_start:.2f} seconds")
 
-    return np.vstack(embeddings)
+        llm_start = time.time()
+        prompt = generate_llm_prompt(user_sequence, aligned_emb.cpu(), books_df)
+        recommendation = llm_inference(prompt)
+        llm_end = time.time()
+        print(f"LLM inference time: {llm_end - llm_start:.2f} seconds")
 
+        print("User History:", user_sequence)
+        print("LLM Recommendation:", recommendation)
+        inference_end = time.time()
+        print(f"Total inference time: {inference_end - inference_start:.2f} seconds")
 
-def generate_gpt_prompt(review_embedding, recommended_description):
-    prompt = (
-        f"Based on the user's review embedding, recommend a book with the following description:\n"
-        f"- Recommended book description: {recommended_description}.\n"
-        f"- Review embedding: {review_embedding[:10]}."
-        F"- Recommend Book : "
-    )
+    total_end_time = time.time()
+    print(f"Total execution time: {total_end_time - total_start_time:.2f} seconds")
 
-    input_ids = gpt_tokenizer.encode(prompt, return_tensors='pt').to(device)
-
-    output = gpt_model.generate(input_ids, max_length=100, num_return_sequences=1)
-
-    generated_text = gpt_tokenizer.decode(output[0], skip_special_tokens=True)
-    
-    return generated_text
-
-def recommend_book(review_embedding, book_embeddings, book_titles, book_descriptions):
-    similarities = cosine_similarity(review_embedding.reshape(1, -1), book_embeddings)
-    recommended_index = np.argmax(similarities)  # 가장 유사한 책 인덱스
-    return book_titles[recommended_index], book_descriptions[recommended_index]  # 추천된 책 제목과 설명 반환
-
-
-
-train_embeddings = get_bert_embeddings(bert_model, train_loader, device)
-
-book_titles = books_df['Title'].tolist()  # 전체 책 제목 리스트
-book_descriptions = books_df['description'].tolist()  # 전체 책 설명 리스트
-book_embeddings = get_book_embeddings(bert_model, book_titles, bert_tokenizer, device)
-
-
-print(f"start recommend")
-first_embedding = train_embeddings[0]  # 첫 번째 임베딩
-recommended_book_title, recommended_book_description = recommend_book(first_embedding, book_embeddings, book_titles, book_descriptions)  # 책 추천
-recommended_text = generate_gpt_prompt(first_embedding, recommended_book_description)  # GPT를 통한 추천 텍스트 생성
-
-print("Recommended Book Title:", recommended_book_title)  # 추천된 책 제목 출력
-print("Recommended Book Description:", recommended_book_description)  # 추천된 책 설명 출력
-print("Generated Recommendation from GPT:", recommended_text)  # GPT 생성 텍스트 출력
+if __name__ == "__main__":
+    main()

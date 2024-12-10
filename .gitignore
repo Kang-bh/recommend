@@ -1,2 +1,3 @@
-../book/
-../__pycahce__/
+/book/
+/__pycahce__/
+.env
